@@ -863,38 +863,85 @@ def _xray_x25519_public_key(private_key_b64: str) -> str:
 
     This ensures the public key in config matches what Xray derives from the
     private key, so Reality handshake works."""
+    import base64 as b64
     try:
-        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-        import base64 as b64
         key = private_key_b64.strip()
         # Xray emits unpadded URL-safe base64 (e.g. "uMbq3TC3..."). Padding is
         # required by the decoder, and "-"/"_" are the URL-safe alphabet.
         priv_bytes = b64.urlsafe_b64decode(key + "=" * (-len(key) % 4))
         if len(priv_bytes) != 32:
             return ""
-        p = X25519PrivateKey.from_private_bytes(priv_bytes)
-        pub_bytes = p.public_key().public_bytes_raw()
+        pub_bytes = _x25519_public_bytes(priv_bytes)
         return b64.urlsafe_b64encode(pub_bytes).decode().rstrip("=")
     except Exception:
         return ""
+
+
+def _x25519_public_bytes(priv_bytes: bytes) -> bytes:
+    """Derive the raw X25519 public key from 32 raw private-key bytes. Uses the
+    cryptography lib when installed (it is not a declared dependency), otherwise
+    a pure-Python RFC 7748 Montgomery ladder, so key handling never depends on it."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        return X25519PrivateKey.from_private_bytes(priv_bytes).public_key().public_bytes_raw()
+    except ImportError:
+        pass
+    p = 2 ** 255 - 19
+    a24 = 121665
+    k = bytearray(priv_bytes)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    k_int = int.from_bytes(bytes(k), "little")
+    x1, x2, z2, x3, z3, swap = 9, 1, 0, 9, 1, 0
+    for t in reversed(range(255)):
+        kt = (k_int >> t) & 1
+        swap ^= kt
+        if swap:
+            x2, x3 = x3, x2
+            z2, z3 = z3, z2
+        swap = kt
+        a = (x2 + z2) % p
+        aa = a * a % p
+        b = (x2 - z2) % p
+        bb = b * b % p
+        e = (aa - bb) % p
+        c = (x3 + z3) % p
+        d = (x3 - z3) % p
+        da = d * a % p
+        cb = c * b % p
+        x3 = pow(da + cb, 2, p)
+        z3 = x1 * pow(da - cb, 2, p) % p
+        x2 = aa * bb % p
+        z2 = e * (aa + a24 * e) % p
+    if swap:
+        x2, x3 = x3, x2
+        z2, z3 = z3, z2
+    return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, "little")
 
 
 def _xray_x25519_keypair() -> tuple:
     """Generate a fresh X25519 keypair as urlsafe base64 WITHOUT padding — the
     exact format Xray's `x25519` emits and the only format Xray-core accepts for
     Reality privateKey (standard padded base64 is rejected: 'invalid privateKey')."""
-    try:
-        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-        import base64 as b64
-        priv = X25519PrivateKey.generate()
-        priv_bytes = priv.private_bytes_raw()
-        pub_bytes = priv.public_key().public_bytes_raw()
-        return (
-            b64.urlsafe_b64encode(priv_bytes).decode().rstrip("="),
-            b64.urlsafe_b64encode(pub_bytes).decode().rstrip("="),
-        )
-    except ImportError:
-        return "", ""
+    import base64 as b64
+    priv_bytes = secrets.token_bytes(32)
+    pub_bytes = _x25519_public_bytes(priv_bytes)
+    return (
+        b64.urlsafe_b64encode(priv_bytes).decode().rstrip("="),
+        b64.urlsafe_b64encode(pub_bytes).decode().rstrip("="),
+    )
+
+
+def _new_reality_keypair() -> tuple:
+    """Return a fresh (private_key, public_key) pair. Prefers the Xray binary,
+    then falls back to local generation. The public key is always re-derived
+    from the private key so the two are guaranteed to match."""
+    xk = _xray_gen_keypair("x25519")
+    priv = _xray_x25519_privkey_norm(xk.get("privatekey", ""))
+    if not priv:
+        priv, _ = _xray_x25519_keypair()
+    return priv, _xray_x25519_public_key(priv)
 
 
 def _xray_x25519_privkey_norm(private_key: str) -> str:
@@ -1307,6 +1354,14 @@ async def startup():
             _changed = True
             logger.info("Reality inbound «%s» private key re-encoded to urlsafe base64", _ib.get("name"))
             _priv = _norm
+        # A stored private key that is not a valid X25519 key (placeholder,
+        # wrong length, bad encoding) can never start Xray: drop it so a fresh
+        # pair is generated below instead of failing config validation.
+        if _priv and not _norm:
+            logger.warning("Reality inbound «%s» has an invalid private key; it will be regenerated", _ib.get("name"))
+            _rs["private_key"] = ""
+            _priv = ""
+            _changed = True
         # If we have a private key, derive its public key — that is the ONLY
         # pbk that works with Xray (which uses the same private key).
         _derived = _xray_x25519_public_key(_priv) if _priv else ""
@@ -1314,16 +1369,26 @@ async def startup():
             _rs["public_key"] = _derived
             _changed = True
             logger.info("Reality inbound «%s» pbk re-derived from private key", _ib.get("name"))
-        if not _rs.get("public_key") or not _rs.get("private_key"):
-            if _gs_rs.get("public_key") and _gs_rs.get("private_key"):
-                _rs.setdefault("public_key", _gs_rs.get("public_key"))
-                _rs.setdefault("private_key", _gs_rs.get("private_key"))
+        if not _priv or not _rs.get("public_key"):
+            # Reuse the global key pair when it is valid; otherwise generate a
+            # new one. Values are assigned (not setdefault) because an existing
+            # empty-string entry would otherwise be kept and fail validation.
+            _gpriv = _xray_x25519_privkey_norm(str(_gs_rs.get("private_key") or ""))
+            _gpub = _xray_x25519_public_key(_gpriv) if _gpriv else ""
+            if _gpriv and _gpub:
+                _rs["private_key"] = _gpriv
+                _rs["public_key"] = _gpub
+                _changed = True
+                logger.info("Reality inbound «%s» backfilled with pbk", _ib.get("name"))
             else:
-                _fresh = _gen_reality_settings()
-                _rs.setdefault("private_key", _fresh.get("private_key", ""))
-                _rs.setdefault("public_key", _fresh.get("public_key", ""))
-            _changed = True
-            logger.info("Reality inbound «%s» backfilled with pbk", _ib.get("name"))
+                _npriv, _npub = _new_reality_keypair()
+                if _npriv and _npub:
+                    _rs["private_key"] = _npriv
+                    _rs["public_key"] = _npub
+                    _changed = True
+                    logger.info("Reality inbound «%s»: generated a new X25519 key pair and persisted it (pbk %s)", _ib.get("name"), _npub)
+                else:
+                    logger.error("Reality inbound «%s»: failed to generate an X25519 key pair", _ib.get("name"))
         _rs.setdefault("short_id", _gs_rs.get("short_id") or secrets.token_hex(5)[:10])
         _sid = str(_rs.get("short_id") or "").strip().lower()
         if not re.fullmatch(r"[0-9a-f]{2,16}", _sid or "") or len(_sid) % 2:
